@@ -1,0 +1,42 @@
+name: GPS2IP T-Dongle checks
+
+on:
+  push:
+    branches: [gps2ip-ble]
+  pull_request:
+    paths: ['TDongleC5_Piglet/**', 'tests/**', '.github/workflows/gps2ip-build.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Packet parser regression tests
+        run: |
+          g++ -std=c++11 -Wall -Wextra -Werror -fsanitize=address,undefined tests/gps2ip_packet_test.cpp -o /tmp/gps2ip-test
+          /tmp/gps2ip-test
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Install pinned toolchain and libraries
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config set board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_dev_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.10
+          arduino-cli lib install --no-deps "TinyGPSPlus@1.0.3" "Adafruit GFX Library@1.12.6" "Adafruit BusIO@1.17.4" "ArduinoJson@7.4.3" "Adafruit ST7735 and ST7789 Library@1.11.0" "NimBLE-Arduino@2.5.1"
+      - name: Compile T-Dongle C5
+        run: |
+          arduino-cli compile --fqbn 'esp32:esp32:XIAO_ESP32C5:CDCOnBoot=cdc,CPUFreq=80,FlashFreq=80,FlashMode=qio,FlashSize=8M,PartitionScheme=huge_app,DebugLevel=none,PSRAM=enabled,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default' --output-dir "$RUNNER_TEMP/gps2ip-build" TDongleC5_Piglet
+      - name: Package firmware with notes
+        run: |
+          mkdir -p dist
+          cp "$RUNNER_TEMP/gps2ip-build/"*.bin dist/
+          cp TDongleC5_Piglet/GPS2IP.md CHANGELOG.md LICENSE dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TDongleC5-GPS2IP
+          path: dist/
+          if-no-files-found: error
