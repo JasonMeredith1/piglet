@@ -425,6 +425,7 @@ static void wgBuildName() {
 static bool wgStackReady = false;
 
 static void wardriveGoBleBegin(bool isCore) {
+  if (phoneGpsMode) return;
   (void)isCore;
   if (wgActive) return;
 

@@ -44,7 +44,7 @@
 #include "YieldSched.h"
 
 // Firmware version
-#define FIRMWARE_VERSION "v2.84"
+#define FIRMWARE_VERSION "v2.84-gps2ip.1"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
@@ -119,6 +119,9 @@ static int tftTextWidth(const char* txt, int textSize = 1) {
 // ---------------- GPS ----------------
 TinyGPSPlus gps;
 HardwareSerial GPSSerial(1);
+#include "Gps2ipBLE.h"
+static bool phoneGpsMode = false;
+static uint32_t phoneGpsTimeoutMs = 5000;
 
 // ---------------- Web ----------------
 WebServer server(80);
@@ -131,6 +134,9 @@ struct Config {
   String wardriverSsid = "Piglet-WARDRIVE";
   String wardriverPsk  = "wardrive1234";
   uint32_t gpsBaud     = 9600;
+  String gpsSource = "gps2ip_ble"; // gps2ip_ble | uart; source changes require reboot
+  String gps2ipDeviceName; // optional exact advertised name
+  uint32_t gps2ipTimeoutMs = 5000;
   String scanMode      = "aggressive";
   String speedUnits    = "kmh";
   // WDGoWars API key from https://wdgwars.pl/profile
@@ -177,6 +183,33 @@ static const char* bootSlogan = nullptr;
 static bool sdOk = false;
 static bool scanningEnabled = true;
 static bool gpsHasFix = false;
+
+// One selected source for every display, mesh and CSV consumer. UART data
+// never leaks into phone mode, and optional phone fields are never invented.
+static void serviceGps() {
+  if (phoneGpsMode) {
+    gps2ipPoll();
+    gpsHasFix = gps2ipFresh(phoneGpsTimeoutMs);
+  } else {
+    while (GPSSerial.available()) gps.encode(GPSSerial.read());
+    gpsHasFix = gps.location.isValid() && gps.location.age() < 2000;
+  }
+}
+static double gpsLat() { return phoneGpsMode ? gps2ipCurrent.lat : gps.location.lat(); }
+static double gpsLon() { return phoneGpsMode ? gps2ipCurrent.lon : gps.location.lng(); }
+static double gpsAlt() { return phoneGpsMode ? (gps2ipCurrent.hasAltitude ? gps2ipCurrent.altitude : 0.0) : (gps.altitude.isValid() ? gps.altitude.meters() : 0.0); }
+static double gpsAccuracy() { return phoneGpsMode ? 0.0 : (gps.hdop.isValid() ? gps.hdop.hdop() : 0.0); }
+static int gpsSats() { return phoneGpsMode ? 0 : (gps.satellites.isValid() ? (int)gps.satellites.value() : 0); }
+static double gpsSpeed() { return phoneGpsMode ? (gpsHasFix && gps2ipCurrent.hasSpeed ? gps2ipCurrent.speedKmph : 0.0) : (gps.speed.isValid() ? gps.speed.kmph() : 0.0); }
+static bool gpsCourseValid() { return phoneGpsMode ? (gpsHasFix && gps2ipCurrent.hasHeading) : (gps.course.isValid() && gps.course.age() < 2000); }
+static double gpsCourse() { return phoneGpsMode ? gps2ipCurrent.heading : gps.course.deg(); }
+static const char* phoneGpsStatus() {
+  if (!gps2ipRunning) return "START FAILED";
+  if (!gps2ipCurrentConnected) return "SEARCHING";
+  if (!gps2ipCurrentReceived) return "WAITING";
+  if (!gps2ipFresh(phoneGpsTimeoutMs)) return "STALE/NO FIX";
+  return time(nullptr) >= 1577836800 ? "LIVE" : "WAIT UTC";
+}
 
 // UI state
 static int   uiGpsSats    = 0;
@@ -385,13 +418,21 @@ static time_t makeUtcEpochFromTm(struct tm* t) {
 }
 
 static String iso8601NowUTC() {
-  if (gps.date.isValid() && gps.time.isValid() &&
+  if (!phoneGpsMode && gps.date.isValid() && gps.time.isValid() &&
       gps.date.age() < 5000 && gps.time.age() < 5000) {
     char buf[32];
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
              gps.date.year(), gps.date.month(), gps.date.day(),
              gps.time.hour(), gps.time.minute(), gps.time.second());
     return String(buf);
+  }
+  if (phoneGpsMode) {
+    time_t now = time(nullptr);
+    if (now >= 1577836800) {
+      struct tm utc; gmtime_r(&now, &utc);
+      char buf[32]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &utc);
+      return String(buf);
+    }
   }
   uint32_t s = millis() / 1000;
   char buf[32];
@@ -425,6 +466,9 @@ static void cfgAssignKV(const String& k, const String& v) {
   else if (k == "homePsk")       cfg.homePsk = v;
   else if (k == "wardriverSsid") cfg.wardriverSsid = v;
   else if (k == "wardriverPsk")  cfg.wardriverPsk = v;
+  else if (k == "gpsSource") { if (v == "uart" || v == "gps2ip_ble") cfg.gpsSource = v; }
+  else if (k == "gps2ipDeviceName") cfg.gps2ipDeviceName = v;
+  else if (k == "gps2ipTimeoutMs") { long t = v.toInt(); if (t >= 1000 && t <= 30000) cfg.gps2ipTimeoutMs = t; }
   else if (k == "gpsBaud") { uint32_t b = (uint32_t)v.toInt(); if (b > 0) cfg.gpsBaud = b; }
   else if (k == "scanMode") { if (v == "aggressive" || v == "powersaving") cfg.scanMode = v; }
   else if (k == "speedUnits") { String vv = v; vv.toLowerCase(); if (vv == "kmh" || vv == "mph") cfg.speedUnits = vv; }
@@ -466,6 +510,9 @@ static bool saveConfigToSD() {
   f.print("homePsk=");         f.println(cfg.homePsk);
   f.print("wardriverSsid=");   f.println(cfg.wardriverSsid);
   f.print("wardriverPsk=");    f.println(cfg.wardriverPsk);
+  f.print("gpsSource="); f.println(cfg.gpsSource);
+  f.print("gps2ipDeviceName="); f.println(cfg.gps2ipDeviceName);
+  f.print("gps2ipTimeoutMs="); f.println(cfg.gps2ipTimeoutMs);
   f.print("gpsBaud=");         f.println(cfg.gpsBaud);
   f.print("scanMode=");        f.println(cfg.scanMode);
   f.print("speedUnits=");      f.println(cfg.speedUnits);
@@ -645,6 +692,11 @@ static bool appendWigleRow(const String& mac, const String& ssid, const String& 
                            const String& firstSeen, int channel, int rssi,
                            double lat, double lon, double altM, double accM) {
   if (!sdOk || !logFile) return false;
+  if (phoneGpsMode) {
+    serviceGps();
+    if (!gpsHasFix || time(nullptr) < 1577836800) return false;
+    lat = gpsLat(); lon = gpsLon(); altM = gpsAlt(); accM = 0.0;
+  }
 
   // Skip logging for any SSID present in the whitelist (exact, case-sensitive match)
   for (int i = 0; i < 10; i++) {
@@ -674,11 +726,19 @@ static bool appendWigleRow(const String& mac, const String& ssid, const String& 
   char safeSsid[70];  // SSID is at most 32 bytes; worst case (all quotes) doubles to 64
   csvEscapeQuotes(ssid, safeSsid, sizeof(safeSsid));
 
+  char altField[24], accField[24];
+  snprintf(altField, sizeof(altField), "%.1f", altM);
+  snprintf(accField, sizeof(accField), "%.1f", accM);
+  if (phoneGpsMode) {
+    if (!gps2ipCurrent.hasAltitude) altField[0] = '\0';
+    accField[0] = '\0'; // LNS Location & Speed does not carry horizontal accuracy
+  }
+  String rowTime = phoneGpsMode ? iso8601NowUTC() : firstSeen;
   char line[256];
   int len = snprintf(line, sizeof(line),
-                      "%s,\"%s\",%s,%s,%d,%u,%d,%.6f,%.6f,%.1f,%.1f,,,WIFI",
-                      mac.c_str(), safeSsid, auth.c_str(), firstSeen.c_str(),
-                      channel, (unsigned)freq, rssi, lat, lon, altM, accM);
+                      "%s,\"%s\",%s,%s,%d,%u,%d,%.6f,%.6f,%s,%s,,,WIFI",
+                      mac.c_str(), safeSsid, auth.c_str(), rowTime.c_str(),
+                      channel, (unsigned)freq, rssi, lat, lon, altField, accField);
   if (len < 0) {
     Serial.println("[SD] appendWigleRow: encoding error, row skipped");
     return false;
@@ -1851,8 +1911,8 @@ static void updateTFT(float speedValue) {
   y += line;
 
   // GPS
-  repaintLine(forceAll || prevGpsFix != gpsHasFix, y,
-    String("GPS: ") + (gpsHasFix ? "FIX" : "---") + " " + String(uiGpsSats) + "sat");
+  repaintLine(forceAll || phoneGpsMode || prevGpsFix != gpsHasFix, y,
+    phoneGpsMode ? String("BLE: ") + phoneGpsStatus() : String("GPS: ") + (gpsHasFix ? "FIX" : "---") + " " + String(uiGpsSats) + "sat");
   prevGpsFix = gpsHasFix;
   y += line;
 
@@ -1994,8 +2054,14 @@ static void drawPageNetworks() {
 
 // Draws GPS satellite-strength bars in the top-right of the header row.
 static void drawGpsSatBars(int y) {
+  if (phoneGpsMode) {
+    tft.fillRect(tft.width()-32, y, 32, 12, BLACK);
+    tft.setCursor(tft.width()-32, y); tft.setTextSize(1);
+    tft.setTextColor(gpsHasFix ? COLOR_GREEN : COLOR_YELLOW, BLACK);
+    tft.print("BLE"); return;
+  }
   int W = tft.width();
-  int sats = (gpsHasFix && gps.satellites.isValid()) ? (int)gps.satellites.value() : 0;
+  int sats = gpsHasFix ? gpsSats() : 0;
   if (sats > 6) sats = 6;
   const int barStep = 5, barMaxH = 12, startX = W - 6 * barStep - 2;
   for (int i = 0; i < 6; i++) {
@@ -2054,9 +2120,8 @@ static void drawPageNavigation(float speedValue) {
   // Update held heading
   uint32_t nowMs = millis();
   if (gpsHasFix &&
-      gps.speed.isValid()  && gps.speed.kmph()  >= HEADING_MIN_SPEED_KMPH &&
-      gps.course.isValid() && gps.course.age()  < 2000) {
-    lastGoodHeadingDeg = gps.course.deg();
+      gpsSpeed() >= HEADING_MIN_SPEED_KMPH && gpsCourseValid()) {
+    lastGoodHeadingDeg = gpsCourse();
     lastGoodHeadingMs  = nowMs;
   }
   bool   haveHeld   = !isnan(lastGoodHeadingDeg) &&
@@ -3081,8 +3146,8 @@ static void coreParseAndLogText(const char* line) {
   String auth=s.substring(p1+1,p2);
   int ch=s.substring(p2+1,p3).toInt(), rssi=s.substring(p3+1).toInt();
   double lat=0, lon=0, altM=0, accM=0;
-  if (gpsHasFix) { lat=gps.location.lat(); lon=gps.location.lng();
-                   altM=gps.altitude.meters(); accM=gps.hdop.hdop(); }
+  if (gpsHasFix) { lat=gpsLat(); lon=gpsLon();
+                   altM=gpsAlt(); accM=gpsAccuracy(); }
   wardriveGoPushAp(bssid, ssid, auth, ch, rssi);
   digitalWrite(PINS.tft_cs, HIGH);
   if (appendWigleRow(bssid, ssid, auth, iso8601NowUTC(), ch, rssi, lat, lon, altM, accM)) {
@@ -3130,7 +3195,7 @@ static void enterCoreMode() {
   // Wardrive Go BLE bridge -- only ever active while on this page, gated on
   // the config toggle. Relays every node-forwarded AP (coreParseAndLogText())
   // plus this Core's own GPS.
-  if (cfg.wardriveGoBridge) wardriveGoBleBegin(true);
+  if (cfg.wardriveGoBridge && !phoneGpsMode) wardriveGoBleBegin(true);
 }
 
 static void exitCoreMode() {
@@ -3138,12 +3203,12 @@ static void exitCoreMode() {
   if (meshCoreActive) esp_now_deinit();
   meshCoreActive=false; coreNodeCount=0;
 
-  wardriveGoBleStop();  // no-op if it was never begun
+  if (!phoneGpsMode) wardriveGoBleStop();  // no-op if it was never begun
 
   WiFi.mode(WIFI_OFF); delay(150);
   WiFi.setAutoReconnect(true);  // restore auto-reconnect for normal wardriving
   WiFi.mode(WIFI_STA); delay(100);
-  while (GPSSerial.available()) gps.encode(GPSSerial.read());
+  serviceGps();
   scanningEnabled=true;
   pageNeedsInit[4]=true;  // force TFT header redraw for Node mode
 }
@@ -3159,9 +3224,9 @@ static void coreModeTick() {
     static uint32_t wgGpsMs = 0;
     if (gpsHasFix && now - wgGpsMs >= 1000) {
       wgGpsMs = now;
-      int sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
-      wardriveGoPushGps(gps.location.lat(), gps.location.lng(),
-                         gps.altitude.isValid() ? gps.altitude.meters() : 0.0, sats);
+      int sats = gpsSats();
+      wardriveGoPushGps(gpsLat(), gpsLon(),
+                         gpsAlt(), sats);
     }
   }
 
@@ -3414,7 +3479,7 @@ static void enterNodeMode() {
 
   // Wardrive Go BLE bridge -- only ever active while on this page, gated on
   // the config toggle. Relays this node's own finds (see nodeDoScanTick()).
-  if (cfg.wardriveGoBridge) wardriveGoBleBegin(false);
+  if (cfg.wardriveGoBridge && !phoneGpsMode) wardriveGoBleBegin(false);
 }
 
 // Exit mesh node mode — call when leaving page 4
@@ -3424,7 +3489,7 @@ static void exitNodeMode() {
   meshNodeActive = false;
   jcmkHaveCore   = false;
 
-  wardriveGoBleStop();  // no-op if it was never begun
+  if (!phoneGpsMode) wardriveGoBleStop();  // no-op if it was never begun
 
   // Full WiFi stack reset: OFF then STA gives a clean state after esp_now_deinit
   WiFi.mode(WIFI_OFF);
@@ -3434,7 +3499,7 @@ static void exitNodeMode() {
   delay(100);
 
   // Drain GPS serial buffer that accumulated during mesh mode scans
-  while (GPSSerial.available()) gps.encode(GPSSerial.read());
+  serviceGps();
 
   // Re-enable scanning so the status page resumes immediately
   scanningEnabled = true;
@@ -3453,9 +3518,9 @@ static void nodeModeTick() {
     static uint32_t wgGpsMs = 0;
     if (gpsHasFix && now - wgGpsMs >= 1000) {
       wgGpsMs = now;
-      int sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
-      wardriveGoPushGps(gps.location.lat(), gps.location.lng(),
-                         gps.altitude.isValid() ? gps.altitude.meters() : 0.0, sats);
+      int sats = gpsSats();
+      wardriveGoPushGps(gpsLat(), gpsLon(),
+                         gpsAlt(), sats);
     }
   }
 
@@ -3526,7 +3591,7 @@ static void nodeModeTick() {
   // coordinator can still be picked up later without needing a restart.
   // jcmkPigletSlotTick() only ever acts for confirmed-Piglet pairings, and
   // only in the gap between scans, so it never affects scan timing itself.
-  if (jcmkHaveCore || cfg.wardriveGoBridge) {
+  if (jcmkHaveCore || (cfg.wardriveGoBridge && !phoneGpsMode)) {
     jcmkPigletSlotTick();
     nodeDoScanTick();
   }
@@ -3536,6 +3601,7 @@ static void nodeModeTick() {
 // cfg.wardriveGoBridge is on. Only three states are shown: NimBLE doesn't
 // expose a separate "streaming" state since subscribe implies streaming.
 static const char* wgStatusLabel() {
+  if (phoneGpsMode) return phoneGpsStatus();
   if (!wardriveGoBridgeRunning())   return "WG: off";
   if (wardriveGoBridgeConnected())  return "WG: connected";
   return "WG: advertising";
@@ -3634,7 +3700,7 @@ static void drawPageMeshNode() {
 
     // Hint (y=110), or Wardrive Go status if the bridge is enabled
     tft.fillRect(0, 110, W, 10, BLACK); tft.setCursor(2, 111);
-    if (cfg.wardriveGoBridge) {
+    if (cfg.wardriveGoBridge && !phoneGpsMode) {
       tft.setTextColor(wardriveGoBridgeConnected() ? COLOR_GREEN : COLOR_YELLOW, BLACK);
       tft.print(wgStatusLabel());
     } else {
@@ -3703,7 +3769,7 @@ static void drawPageMeshNode() {
 
     // Hold hint (y=117), or Wardrive Go status if the bridge is enabled
     tft.fillRect(0, 117, W, 10, BLACK); tft.setCursor(2, 118);
-    if (cfg.wardriveGoBridge) {
+    if (cfg.wardriveGoBridge && !phoneGpsMode) {
       tft.setTextColor(wardriveGoBridgeConnected() ? COLOR_GREEN : COLOR_YELLOW, BLACK);
       tft.print(wgStatusLabel());
     } else {
@@ -3780,7 +3846,12 @@ static void handleStatus() {
   doc["scanningEnabled"] = scanningEnabled;
   doc["allowScan"] = allowScan;
   doc["sdOk"] = sdOk;
+  serviceGps();
   doc["gpsFix"] = gpsHasFix;
+  doc["gpsSource"] = phoneGpsMode ? "gps2ip_ble" : "uart";
+  doc["gps2ipStatus"] = phoneGpsMode ? phoneGpsStatus() : "DISABLED";
+  doc["gps2ipConnected"] = phoneGpsMode && gps2ipCurrentConnected;
+  doc["gpsClockReady"] = time(nullptr) >= 1577836800;
   doc["found2g"] = networksFound2G;
   doc["found5g"] = networksFound5G;
   doc["wifiConnected"] = (WiFi.status() == WL_CONNECTED);
@@ -3821,6 +3892,9 @@ static void handleStatus() {
   c["wardriverSsid"] = cfg.wardriverSsid;
   c["wardriverPsk"] = cfg.wardriverPsk;
   c["gpsBaud"] = cfg.gpsBaud;
+  c["gpsSource"] = cfg.gpsSource;
+  c["gps2ipDeviceName"] = cfg.gps2ipDeviceName;
+  c["gps2ipTimeoutMs"] = cfg.gps2ipTimeoutMs;
   c["scanMode"] = cfg.scanMode;
   c["speedUnits"] = cfg.speedUnits;
   c["maxBootUploads"] = cfg.maxBootUploads;
@@ -4311,13 +4385,13 @@ static bool connectSTA(uint32_t timeoutMs) {
   while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs) {
     // Drain GPS buffer every poll cycle — at 9600 baud, ~192 bytes arrive per 200ms
     // delay, which would overflow the buffer in ~2 iterations without draining.
-    while (GPSSerial.available()) gps.encode(GPSSerial.read());
+    serviceGps();
     delay(200);
     if (WiFi.softAPgetStationNum() > 0) apClientSeen = true;
   }
   bool ok = (WiFi.status() == WL_CONNECTED);
   Serial.println(ok ? "[WIFI] Connected" : "[WIFI] Failed");
-  if (ok) { Serial.print("[WIFI] IP: "); Serial.println(WiFi.localIP()); fixDnsIfNeeded(); }
+  if (ok) { Serial.print("[WIFI] IP: "); Serial.println(WiFi.localIP()); fixDnsIfNeeded(); if (phoneGpsMode) configTime(0, 0, "pool.ntp.org", "time.nist.gov"); }
   return ok;
 }
 
@@ -4448,17 +4522,18 @@ static const uint32_t GPS_CACHE_MAX_MS = 180000UL;  // discard cache after 3 min
 
 // ---------------- Scan (2.4 + 5 GHz) ----------------
 static void processScanResults(int n) {
+  serviceGps(); // recheck freshness after the asynchronous Wi-Fi scan
   if (n <= 0) { WiFi.scanDelete(); return; }
 
   String firstSeen = iso8601NowUTC();
   double lat = 0, lon = 0, altM = 0, accM = 0;
   if (gpsHasFix) {
-    lat  = gps.location.lat();
-    lon  = gps.location.lng();
-    altM = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
-    accM = gps.hdop.isValid()     ? gps.hdop.hdop()       : 0.0;
+    lat  = gpsLat();
+    lon  = gpsLon();
+    altM = gpsAlt();
+    accM = gpsAccuracy();
     // lastLat/lastLon is maintained by loop() — no update here.
-  } else if (lastGpsValid && (millis() - lastGpsValidMs) <= GPS_CACHE_MAX_MS) {
+  } else if (!phoneGpsMode && lastGpsValid && (millis() - lastGpsValidMs) <= GPS_CACHE_MAX_MS) {
     lat  = lastLat;
     lon  = lastLon;
     altM = lastAlt;
@@ -4493,6 +4568,8 @@ static void processScanResults(int n) {
     if (is2g) networksFound2G++;
     else      networksFound5G++;
 
+    // Phone GPS must be live at write time; never stamp a drive with a cached fix.
+    if (phoneGpsMode) { serviceGps(); if (!gpsHasFix) continue; }
     if (appendWigleRow(mac, ssid, authStr, firstSeen, ch, rssi, lat, lon, altM, accM)) wrote++;
   }
 
@@ -4653,9 +4730,10 @@ static void pollButton() {
       // bridge immediately (mesh mode is already active on this page) and
       // persist the setting, so it also auto-starts on this page after a
       // reboot -- same effect as flipping the Web UI toggle and saving.
+      if (phoneGpsMode) { clickCount = 0; Serial.println("[GPS2IP] Wardrive Go bridge disabled in phone GPS mode"); return; }
       cfg.wardriveGoBridge = !cfg.wardriveGoBridge;
       saveConfigToSD();
-      if (cfg.wardriveGoBridge) wardriveGoBleBegin(meshCoreActive);
+      if (cfg.wardriveGoBridge && !phoneGpsMode) wardriveGoBleBegin(meshCoreActive);
       else                      wardriveGoBleSuspend();
       Serial.print("[BTN] Double press -> Wardrive Go bridge ");
       Serial.println(cfg.wardriveGoBridge ? "ENABLED" : "DISABLED");
@@ -4722,6 +4800,8 @@ void setup() {
 
   // Load config
   if (sdOk) loadConfigFromSD();
+  phoneGpsMode = cfg.gpsSource == "gps2ip_ble";
+  phoneGpsTimeoutMs = cfg.gps2ipTimeoutMs;
 
   // TFT init (after SD)
   digitalWrite(PINS.tft_rst, HIGH);
@@ -4749,6 +4829,9 @@ void setup() {
     else { sdOk = false; ledRed(); }
   }
 
+  if (phoneGpsMode) {
+    gps2ipBegin(cfg.gps2ipDeviceName);
+  } else {
   // GPS (UART via Qwiic connector)
   // QWIIC pinout: RX = GPIO12 (from GPS TX), TX = GPIO11 (to GPS RX).
   // RX buffer 512 bytes: at 9600 baud the default 256-byte buffer fills in ~267ms.
@@ -4765,7 +4848,7 @@ void setup() {
     Serial.println("[GPS] Checking wiring...");
     uint32_t gpsCheckEnd = millis() + 2000;
     while (millis() < gpsCheckEnd) {
-      while (GPSSerial.available()) gps.encode(GPSSerial.read());
+      serviceGps();
       delay(10);
     }
     uint32_t chars     = gps.charsProcessed();
@@ -4785,6 +4868,8 @@ void setup() {
                     chars, sentences, failed);
     }
   }
+
+  } // wired GPS setup
 
   // WiFi setup: mesh boot with a home network connects STA first for auto-upload,
   // then hands off to mesh. Mesh boot with no home network skips STA/AP entirely.
@@ -4939,25 +5024,25 @@ void loop() {
   stopAPIfAllowed();
 
   // GPS
-  while (GPSSerial.available()) gps.encode(GPSSerial.read());
+  serviceGps();
 
-  bool prevFix = gpsHasFix;
-  gpsHasFix = gps.location.isValid() && gps.location.age() < 2000;
+  static bool prevFix = false;
   if (gpsHasFix != prevFix) {
     Serial.println(gpsHasFix ? "[GPS] LOCKED" : "[GPS] NO FIX");
+    prevFix = gpsHasFix;
   }
 
   // Update last-known-good position every loop — decoupled from scan results
   // so it stays current even when no networks are found.
   // Quality gate: HDOP ≤ 10 and ≥ 3 satellites guards against brief bad fixes
   // (e.g. re-acquisition after a tunnel) overwriting a good cached position.
-  if (gpsHasFix) {
+  if (!phoneGpsMode && gpsHasFix) {
     float hdop = gps.hdop.isValid()       ? gps.hdop.hdop()           : 99.0f;
-    int   sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+    int   sats = gpsSats();
     if (hdop <= 10.0f && sats >= 3) {
-      lastLat        = gps.location.lat();
-      lastLon        = gps.location.lng();
-      lastAlt        = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
+      lastLat        = gpsLat();
+      lastLon        = gpsLon();
+      lastAlt        = gpsAlt();
       lastAcc        = hdop;
       lastGpsValid   = true;
       lastGpsValidMs = millis();
@@ -4965,14 +5050,14 @@ void loop() {
   }
 
   // GPS health log every 10 s until fix acquired
-  if (!gpsHasFix) {
+  if (!phoneGpsMode && !gpsHasFix) {
     static uint32_t lastGpsDiagMs = 0;
     if (millis() - lastGpsDiagMs >= 10000) {
       lastGpsDiagMs = millis();
       uint32_t chars  = gps.charsProcessed();
       uint32_t ok     = gps.passedChecksum();
       uint32_t failed = gps.failedChecksum();
-      int      sats   = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+      int      sats   = gpsSats();
       Serial.printf("[GPS] chars=%lu ok=%lu fail=%lu sats=%d fix=NO\n",
                     chars, ok, failed, sats);
       if (chars == 0)
@@ -4984,19 +5069,31 @@ void loop() {
     }
   }
 
-  uiGpsSats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+  uiGpsSats = gpsSats();
 
-  float speedKmph = gps.speed.isValid() ? gps.speed.kmph() : 0.0f;
+  float speedKmph = gpsSpeed();
   float speedDisplay = (cfg.speedUnits == "mph") ? speedKmph * 0.621371f : speedKmph;
 
-  if (gps.course.isValid() && gps.course.age() < 2000) {
-    uiHeadingDeg = gps.course.deg();
+  if (gpsCourseValid()) {
+    uiHeadingDeg = gpsCourse();
     uiHeadingTxt = headingToDir8(uiHeadingDeg);
+  }
+
+  // LNS UTC is optional. Don't invent a date if the phone omits it.
+  static uint32_t phoneTimeAt = 0;
+  if (phoneGpsMode && gpsHasFix && gps2ipCurrent.hasUtc && phoneTimeAt != gps2ipCurrentAt) {
+    struct tm t {};
+    t.tm_year = gps2ipCurrent.year - 1900; t.tm_mon = gps2ipCurrent.month - 1;
+    t.tm_mday = gps2ipCurrent.day; t.tm_hour = gps2ipCurrent.hour;
+    t.tm_min = gps2ipCurrent.minute; t.tm_sec = gps2ipCurrent.second;
+    time_t epoch = makeUtcEpochFromTm(&t);
+    struct timeval now = { .tv_sec = epoch + (millis()-gps2ipCurrentAt)/1000, .tv_usec = 0 };
+    settimeofday(&now, nullptr); phoneTimeAt = gps2ipCurrentAt;
   }
 
   // Set system time from GPS (once)
   static bool timeSet = false;
-  if (!timeSet && gps.date.isValid() && gps.time.isValid() &&
+  if (!phoneGpsMode && !timeSet && gps.date.isValid() && gps.time.isValid() &&
       gps.date.age() < 5000 && gps.time.age() < 5000) {
     struct tm t {};
     t.tm_year = gps.date.year() - 1900;
