@@ -1,3 +1,8 @@
+> **GPS2IP BLE fork:** The T-Dongle C5 variant now supports iPhone GPS2IP via
+> Bluetooth LE, with wired GPS selectable in settings. See
+> [setup, build and validation notes](TDongleC5_Piglet/GPS2IP.md).
+> The committed upstream `build/` binaries do not include this change.
+
 
 # Piglet Wardriver
 

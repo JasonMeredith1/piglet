@@ -1,3 +1,14 @@
+## v2.84-gps2ip.1 (GPS2IP BLE fork)
+
+- Add paired GPS2IP BLE LNS client for T-Dongle C5, with a separate reconnect task.
+- Select phone or wired UART GPS in the web UI; apply source/name/timeout on restart.
+- Feed phone coordinates and optional speed, heading, elevation and UTC into the UI and CSV logging.
+- Show BLE state without fabricated satellite counts; suppress phone geotagging after disconnect, invalid position or expiry.
+- Require a real clock for phone CSV logging; leave unavailable elevation/accuracy empty.
+- Prevent the Wardrive Go server and mesh page teardown from disrupting the phone BLE client.
+- Add packet/freshness regression tests, build workflow and setup notes.
+- Hardware pairing, background updates and radio coexistence remain to be field-tested.
+
 # Changelog
 
 ## v2.84 (2026-10-30)
